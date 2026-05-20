@@ -567,6 +567,13 @@ setup_runner_instance() {
   sudo cp -a "${pkg_dir}/." "${instance_dir}/"
   sudo chown -R "${RUNNER_USER}:${RUNNER_USER}" "${instance_dir}"
 
+  # Give each instance its own Docker config dir so concurrent jobs cannot
+  # invalidate each other's registry credentials (docker/login-action logs out
+  # as a post-step, which would wipe the shared ~/.docker/config.json).
+  sudo -u "${RUNNER_USER}" mkdir -p "${instance_dir}/.docker"
+  echo "DOCKER_CONFIG=${instance_dir}/.docker" \
+    | sudo tee "${instance_dir}/.env" > /dev/null
+
   local arch_label
   case "$RUNNER_ARCH" in
     x64)   arch_label="X64"   ;;
