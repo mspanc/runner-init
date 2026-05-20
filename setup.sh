@@ -23,14 +23,140 @@ section() { echo -e "\n${BLUE}══ $* ══${NC}"; }
 die()     { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-: "${GITHUB_TOKEN:?GITHUB_TOKEN env var is required}"
-: "${GITHUB_OWNER:?GITHUB_OWNER env var is required}"
-GITHUB_REPO="${GITHUB_REPO:-}"
-RUNNER_COUNT="${RUNNER_COUNT:-1}"
-RUNNER_LABELS="${RUNNER_LABELS:-}"
-RUNNER_WORKDIR="${RUNNER_WORKDIR:-/opt/actions-runner}"
+# Optional vars are intentionally NOT defaulted here so that validate_env can
+# distinguish "user set this" from "never set" and prompt accordingly.
 RUNNER_USER="runner"
-RUNNER_NAME_PREFIX="${RUNNER_NAME_PREFIX:-$(hostname -s)}"
+FORCE=false
+
+# ── Env var validation + interactive prompting ─────────────────────────────────
+validate_env() {
+  local interactive=false
+  [[ -t 0 ]] && interactive=true
+
+  # ── Required ────────────────────────────────────────────────────────────────
+  if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+    $interactive || true
+    if $interactive; then
+      read -rsp "  GitHub token (PAT, input hidden): " GITHUB_TOKEN; echo >&2
+      export GITHUB_TOKEN
+    fi
+  fi
+
+  if [[ -z "${GITHUB_OWNER:-}" ]]; then
+    if $interactive; then
+      read -rp  "  GitHub owner (org or user): " GITHUB_OWNER; export GITHUB_OWNER
+    fi
+  fi
+
+  # ── Optional: only prompt if the variable was never set in the environment ──
+  if ! [[ -v GITHUB_REPO ]]; then
+    if $interactive; then
+      read -rp "  Repository name (blank = org-level runners): " GITHUB_REPO
+    else
+      GITHUB_REPO=""
+    fi
+    export GITHUB_REPO
+  fi
+
+  if ! [[ -v RUNNER_COUNT ]]; then
+    if $interactive; then
+      read -rp "  Runner instances [1]: " RUNNER_COUNT
+    fi
+    RUNNER_COUNT="${RUNNER_COUNT:-1}"
+    export RUNNER_COUNT
+  fi
+
+  if ! [[ -v RUNNER_LABELS ]]; then
+    if $interactive; then
+      read -rp "  Extra labels, comma-separated (blank = none): " RUNNER_LABELS
+    else
+      RUNNER_LABELS=""
+    fi
+    export RUNNER_LABELS
+  fi
+
+  if ! [[ -v RUNNER_WORKDIR ]]; then
+    if $interactive; then
+      read -rp "  Work directory [/opt/actions-runner]: " RUNNER_WORKDIR
+    fi
+    RUNNER_WORKDIR="${RUNNER_WORKDIR:-/opt/actions-runner}"
+    export RUNNER_WORKDIR
+  fi
+
+  if ! [[ -v RUNNER_NAME_PREFIX ]]; then
+    local default_prefix
+    default_prefix=$(hostname -s)
+    if $interactive; then
+      read -rp "  Runner name prefix [${default_prefix}]: " RUNNER_NAME_PREFIX
+    fi
+    RUNNER_NAME_PREFIX="${RUNNER_NAME_PREFIX:-${default_prefix}}"
+    export RUNNER_NAME_PREFIX
+  fi
+
+  # ── Fail if required vars are still empty ───────────────────────────────────
+  local missing=()
+  [[ -z "${GITHUB_TOKEN:-}" ]] && missing+=("GITHUB_TOKEN  – PAT with repo or admin:org scope")
+  [[ -z "${GITHUB_OWNER:-}" ]] && missing+=("GITHUB_OWNER  – GitHub org or user name")
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo -e "${RED}[ERROR]${NC} Missing required variables:\n" >&2
+    for var in "${missing[@]}"; do
+      echo -e "  ${YELLOW}•${NC} ${var}" >&2
+    done
+    echo >&2
+    echo -e "  Run interactively to be prompted, or pass via environment:" >&2
+    echo -e "  GITHUB_TOKEN=ghp_… GITHUB_OWNER=my-org bash setup.sh" >&2
+    exit 1
+  fi
+
+  if ! [[ "${RUNNER_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+    die "RUNNER_COUNT must be a positive integer (got: '${RUNNER_COUNT}')"
+  fi
+}
+
+# ── GitHub token preflight ─────────────────────────────────────────────────────
+check_github_permissions() {
+  section "Checking GitHub token permissions"
+
+  local url scope_hint
+  if [[ -n "${GITHUB_REPO}" ]]; then
+    url="https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/actions/runners/registration-token"
+    scope_hint="Classic PAT : 'repo' scope\n  Fine-grained: Administration → Read and write"
+  else
+    url="https://api.github.com/orgs/${GITHUB_OWNER}/actions/runners/registration-token"
+    scope_hint="Classic PAT : 'admin:org' scope\n  Fine-grained: Self-hosted runners → Read and write  (org owner required)"
+  fi
+
+  local body http_code
+  body=$(curl -sS -w '\n%{http_code}' -X POST \
+    -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "$url")
+  http_code=$(tail -1 <<< "$body")
+  body=$(sed '$d' <<< "$body")
+
+  case "$http_code" in
+    201)
+      info "Token OK — runner registration permitted"
+      ;;
+    401)
+      die "Token is invalid or expired (401).\n\n  Generate a new token and set GITHUB_TOKEN."
+      ;;
+    403)
+      die "Token lacks runner registration permission (403).\n\n  Required:\n  ${scope_hint}"
+      ;;
+    404)
+      local target="${GITHUB_OWNER}${GITHUB_REPO:+/${GITHUB_REPO}}"
+      die "'${target}' not found or token has no visibility (404).\n\n  Check GITHUB_OWNER / GITHUB_REPO and that the token has:\n  ${scope_hint}"
+      ;;
+    *)
+      local message
+      message=$(jq -r '.message // empty' <<< "$body" 2>/dev/null || true)
+      die "GitHub API error (HTTP ${http_code})${message:+: ${message}}"
+      ;;
+  esac
+}
 
 # ── Architecture ───────────────────────────────────────────────────────────────
 case "$(uname -m)" in
@@ -139,6 +265,23 @@ install_dotnet() {
     | sudo bash -s -- --channel 10.0 --install-dir "$install_dir" --no-path
   sudo ln -sf "${install_dir}/dotnet" /usr/local/bin/dotnet
   printf 'export DOTNET_ROOT=%s\n' "$install_dir" | sudo tee /etc/profile.d/dotnet.sh > /dev/null
+}
+
+install_postgres_client() {
+  section "PostgreSQL client"
+  if dpkg -s postgresql-client-18 &>/dev/null 2>&1; then
+    info "Already installed: $(psql --version)"; return
+  fi
+
+  curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    | sudo gpg --dearmor --yes -o /usr/share/keyrings/postgresql.gpg
+
+  echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] \
+https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+    | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+
+  apt_update
+  apt_install postgresql-client-18
 }
 
 install_rust() {
@@ -252,6 +395,71 @@ https://cli.github.com/packages stable main" \
   apt_install gh
 }
 
+install_cleanup_cron() {
+  section "Cleanup cron"
+
+  local script_path="/usr/local/bin/runner-cleanup.sh"
+  local cron_path="/etc/cron.d/runner-cleanup"
+  local logrotate_path="/etc/logrotate.d/runner-cleanup"
+
+  sudo tee "$script_path" > /dev/null << SCRIPT
+#!/usr/bin/env bash
+# Periodic cleanup of Docker cache and GitHub Actions runner artifacts.
+set -euo pipefail
+
+LOG=/var/log/runner-cleanup.log
+RUNNER_WORKDIR="${RUNNER_WORKDIR}"
+
+{
+  echo "=== \$(date -Iseconds) ==="
+  echo "Disk before : \$(df -h / | awk 'NR==2{print \$4}') free"
+
+  echo "-- stopped containers --"
+  docker container prune -f
+
+  echo "-- images unused for 24 h+ --"
+  docker image prune -af --filter "until=24h"
+
+  echo "-- build cache older than 24 h --"
+  docker builder prune -af --filter "until=24h"
+
+  echo "-- unused volumes --"
+  docker volume prune -f
+
+  echo "-- runner workspaces not touched in 24 h+ --"
+  find "\${RUNNER_WORKDIR}"/*/._work -mindepth 1 -maxdepth 1 \
+    -type d -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+
+  echo "-- /tmp entries older than 1 day --"
+  find /tmp -mindepth 1 -maxdepth 1 -mtime +1 ! -name '.X*' \
+    -exec rm -rf {} + 2>/dev/null || true
+
+  echo "Disk after  : \$(df -h / | awk 'NR==2{print \$4}') free"
+  echo "==="
+} >> "\$LOG" 2>&1
+SCRIPT
+
+  sudo chmod 0755 "$script_path"
+
+  # Run daily at 03:00 as root (needs docker socket + write access to workdir)
+  echo "0 3 * * * root ${script_path}" | sudo tee "$cron_path" > /dev/null
+  sudo chmod 0644 "$cron_path"
+
+  # Rotate the log weekly, keep 4 weeks
+  sudo tee "$logrotate_path" > /dev/null << 'EOF'
+/var/log/runner-cleanup.log {
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+}
+EOF
+
+  info "Cleanup cron installed → daily at 03:00 (${script_path})"
+  info "Logs          → /var/log/runner-cleanup.log (weekly rotation, 4 weeks)"
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Runner setup
 # ══════════════════════════════════════════════════════════════════════════════
@@ -314,20 +522,44 @@ runner_url() {
   fi
 }
 
+# Returns 0 if the instance is already configured, registered, and its service is active.
+runner_instance_ok() {
+  local idx=$1
+  local instance_dir="${RUNNER_WORKDIR}/${idx}"
+  local expected_name="${RUNNER_NAME_PREFIX}-${idx}"
+
+  [[ -f "${instance_dir}/.runner" ]]   || return 1
+  [[ -f "${instance_dir}/.service" ]]  || return 1
+
+  local name url svc
+  name=$(jq -r '.agentName // empty' "${instance_dir}/.runner" 2>/dev/null)
+  url=$(jq  -r '.gitHubUrl // empty' "${instance_dir}/.runner" 2>/dev/null)
+  svc=$(cat "${instance_dir}/.service")
+
+  [[ "$name" == "$expected_name" ]]  || return 1
+  [[ "$url"  == "$(runner_url)" ]]   || return 1
+  systemctl is-active --quiet "$svc" 2>/dev/null || return 1
+
+  return 0
+}
+
 setup_runner_instance() {
   local idx=$1
   local instance_dir="${RUNNER_WORKDIR}/${idx}"
   local runner_name="${RUNNER_NAME_PREFIX}-${idx}"
   local pkg_dir="${RUNNER_WORKDIR}/.pkg"
 
+  if [[ "${FORCE}" == "false" ]] && runner_instance_ok "$idx"; then
+    info "Runner '${runner_name}' already configured and running — skipping"
+    return
+  fi
+
   info "Configuring instance ${idx} → '${runner_name}'"
 
   # Tear down previous installation cleanly before reconfiguring
   if [[ -f "${instance_dir}/svc.sh" ]]; then
-    pushd "${instance_dir}" > /dev/null
-    sudo ./svc.sh stop      2>/dev/null || true
-    sudo ./svc.sh uninstall 2>/dev/null || true
-    popd > /dev/null
+    ( cd "${instance_dir}" && sudo ./svc.sh stop 2>/dev/null || true )
+    ( cd "${instance_dir}" && sudo ./svc.sh uninstall 2>/dev/null || true )
   fi
 
   sudo rm -rf "${instance_dir}"
@@ -362,10 +594,7 @@ setup_runner_instance() {
       --replace
   "
 
-  pushd "${instance_dir}" > /dev/null
-  sudo ./svc.sh install "${RUNNER_USER}"
-  sudo ./svc.sh start
-  popd > /dev/null
+  ( cd "${instance_dir}" && sudo ./svc.sh install "${RUNNER_USER}" && sudo ./svc.sh start )
 
   info "Runner '${runner_name}' started"
 }
@@ -374,17 +603,98 @@ setup_runner_instance() {
 # Entry point
 # ══════════════════════════════════════════════════════════════════════════════
 
-main() {
-  [[ "$(id -u)" -eq 0 ]] && die "Run as a non-root user with sudo privileges."
-  command -v sudo &>/dev/null  || die "sudo not found"
-  command -v curl &>/dev/null  || die "curl not found — install it first"
+print_plan() {
+  local target arch_label labels instance_range
+  target="${GITHUB_OWNER}/${GITHUB_REPO:-<org-level>}"
 
-  info "GitHub Actions runner bootstrap"
-  info "  Owner    : ${GITHUB_OWNER}"
-  info "  Repo     : ${GITHUB_REPO:-<org-level>}"
-  info "  Instances: ${RUNNER_COUNT}"
-  info "  Workdir  : ${RUNNER_WORKDIR}"
-  info "  Arch     : ${RUNNER_ARCH}"
+  case "$RUNNER_ARCH" in
+    x64)   arch_label="X64"   ;;
+    arm64) arch_label="ARM64" ;;
+  esac
+  labels="self-hosted, Linux, ${arch_label}"
+  [[ -n "${RUNNER_LABELS}" ]] && labels="${labels}, ${RUNNER_LABELS}"
+
+  if [[ "${RUNNER_COUNT}" -eq 1 ]]; then
+    instance_range="${RUNNER_NAME_PREFIX}-1"
+  else
+    instance_range="${RUNNER_NAME_PREFIX}-1 … ${RUNNER_NAME_PREFIX}-${RUNNER_COUNT}"
+  fi
+
+  echo
+  echo -e "${BLUE}┌─ GitHub Actions Runner Bootstrap ──────────────────────────┐${NC}"
+  printf  "${BLUE}│${NC}  %-18s %s\n" "Target:"       "$target"
+  printf  "${BLUE}│${NC}  %-18s %s\n" "Instances:"    "${RUNNER_COUNT}  (${instance_range})"
+  printf  "${BLUE}│${NC}  %-18s %s\n" "Labels:"       "$labels"
+  printf  "${BLUE}│${NC}  %-18s %s\n" "Work dir:"     "${RUNNER_WORKDIR}"
+  printf  "${BLUE}│${NC}  %-18s %s\n" "Runner user:"  "${RUNNER_USER}"
+  printf  "${BLUE}│${NC}  %-18s %s\n" "Arch:"         "${RUNNER_ARCH}"
+  if [[ "${FORCE}" == "true" ]]; then
+    printf "${BLUE}│${NC}  %-18s %s\n" "Mode:" "forced — re-register all runners"
+  else
+    printf "${BLUE}│${NC}  %-18s %s\n" "Mode:" "skip already-running runners  (--force to override)"
+  fi
+  echo -e "${BLUE}│${NC}"
+  printf  "${BLUE}│${NC}  Tools: Docker · Node 24 · Go · .NET 10 · Rust · Java · PostgreSQL 18 client\n"
+  printf  "${BLUE}│${NC}         AWS CLI · Azure CLI · gcloud · kubectl · Helm · gh\n"
+  printf  "${BLUE}│${NC}  Cron  : daily Docker + workspace cleanup at 03:00\n"
+  echo -e "${BLUE}└────────────────────────────────────────────────────────────┘${NC}"
+  echo
+}
+
+countdown() {
+  local secs=${1:-5}
+  for ((i = secs; i > 0; i--)); do
+    printf "\r  ${YELLOW}Ctrl+C to abort.${NC} Starting in %d second(s)..." "$i"
+    sleep 1
+  done
+  printf "\r  %-60s\n" "Starting..."
+}
+
+main() {
+  for arg in "$@"; do
+    case "$arg" in
+      --force) FORCE=true ;;
+      *) die "Unknown argument: ${arg}\n\n  Usage: bash setup.sh [--force]" ;;
+    esac
+  done
+
+  validate_env
+
+  # If running as root: create the dedicated runner user (if absent), grant it
+  # passwordless sudo with env passthrough, then re-exec as that user.
+  if [[ "$(id -u)" -eq 0 ]]; then
+    [[ -f "$0" ]] || die "Root re-exec requires a file path — cannot re-exec from a pipe."
+
+    if ! id "${RUNNER_USER}" &>/dev/null; then
+      useradd --system --create-home --shell /bin/bash \
+        --comment "GitHub Actions runner" "${RUNNER_USER}"
+      info "Created dedicated user '${RUNNER_USER}'"
+    else
+      info "Using existing user '${RUNNER_USER}'"
+    fi
+
+    local sudoers_file="/etc/sudoers.d/90-${RUNNER_USER}-runner"
+    printf '%s ALL=(ALL) NOPASSWD:ALL\nDefaults:%s !env_reset, !requiretty\n' \
+      "${RUNNER_USER}" "${RUNNER_USER}" > "${sudoers_file}"
+    chmod 0440 "${sudoers_file}"
+
+    local script_copy="/home/${RUNNER_USER}/setup.sh"
+    cp "$0" "${script_copy}"
+    chown "${RUNNER_USER}:${RUNNER_USER}" "${script_copy}"
+    chmod 0750 "${script_copy}"
+    info "Script copied to ${script_copy}"
+
+    info "Re-executing as '${RUNNER_USER}'..."
+    exec sudo -E -u "${RUNNER_USER}" env HOME="/home/${RUNNER_USER}" bash -s -- "$@" < "$0"
+  fi
+
+  command -v sudo &>/dev/null || die "sudo not found"
+  command -v curl &>/dev/null || die "curl not found — install it first"
+
+  check_github_permissions
+
+  print_plan
+  countdown 5
 
   install_system_packages
 
@@ -395,6 +705,7 @@ main() {
   install_node
   install_go
   install_dotnet
+  install_postgres_client
   install_rust
   install_aws_cli
   install_azure_cli
@@ -402,6 +713,7 @@ main() {
   install_kubectl
   install_helm
   install_gh_cli
+  install_cleanup_cron
 
   download_runner
 
