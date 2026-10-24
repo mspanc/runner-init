@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Bootstrap GitHub Actions self-hosted runners on a fresh Ubuntu LTS machine.
 #
-# Required env vars:
+# Usage: bash setup.sh [--force | --os-only]
+# --os-only updates host tools/configuration without GitHub credentials or registration.
+#
+# Required env vars (registration mode only):
 #   GITHUB_TOKEN   – PAT with repo or admin:org scope
 #   GITHUB_OWNER   – GitHub org or user
 #
@@ -27,6 +30,11 @@ die()     { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 # distinguish "user set this" from "never set" and prompt accordingly.
 RUNNER_USER="runner"
 FORCE=false
+OS_ONLY=false
+ANDROID_SDK_DIR="/opt/android-sdk"
+ANDROID_CMDLINE_TOOLS_VERSION="15859902"
+ANDROID_CMDLINE_TOOLS_SHORT_VERSION="22.0"
+ANDROID_JAVA_HOME="/usr/lib/jvm/java-17-openjdk-amd64"
 
 # ── Env var validation + interactive prompting ─────────────────────────────────
 validate_env() {
@@ -234,6 +242,133 @@ install_node() {
   curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
   apt_install nodejs
   sudo npm install -g yarn pnpm corepack
+}
+
+# Android versions match the Petsy Expo/React Native build and API 35 smoke test.
+install_android() {
+  section "Android SDK and emulator"
+  if [[ "$RUNNER_ARCH" != "x64" ]]; then
+    info "Skipping Android emulator toolchain: this suite requires Linux x64"
+    return
+  fi
+
+  apt_install openjdk-17-jdk-headless ninja-build qemu-kvm cpu-checker \
+    libgl1 libegl1 libnss3 libpulse0 libasound2-dev libx11-6 libxcb1 \
+    libxcomposite1 libxcursor1 libxi6 libxrandr2 libxrender1 libxtst6 \
+    libxkbcommon0 libxkbcommon-x11-0 libxcb-cursor0 libvulkan1 mesa-vulkan-drivers
+
+  if ! sudo modprobe kvm; then
+    die "Cannot load KVM. Enable virtualization on the host (nested virtualization for a VM)."
+  fi
+  if grep -q GenuineIntel /proc/cpuinfo; then
+    sudo modprobe kvm_intel || die "Cannot load kvm_intel. Enable Intel VT-x on the host."
+  elif grep -q AuthenticAMD /proc/cpuinfo; then
+    sudo modprobe kvm_amd || die "Cannot load kvm_amd. Enable AMD-V on the host."
+  fi
+  [[ -c /dev/kvm ]] || die "/dev/kvm is missing. Enable Intel VT-x/AMD-V on the host."
+  sudo groupadd -f kvm
+  sudo usermod -aG kvm "${RUNNER_USER}"
+  echo 'KERNEL=="kvm", GROUP="kvm", MODE="0660"' \
+    | sudo tee /etc/udev/rules.d/99-github-runner-kvm.rules > /dev/null
+  sudo udevadm control --reload-rules
+  sudo udevadm trigger --name-match=kvm
+  sudo chgrp kvm /dev/kvm
+  sudo chmod 0660 /dev/kvm
+
+  sudo install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" "${ANDROID_SDK_DIR}/cmdline-tools"
+  sudo chown -R "${RUNNER_USER}:${RUNNER_USER}" "${ANDROID_SDK_DIR}"
+  local tools_dir="${ANDROID_SDK_DIR}/cmdline-tools/${ANDROID_CMDLINE_TOOLS_SHORT_VERSION}"
+  local temp_dir
+  temp_dir=$(mktemp -d)
+  if [[ ! -x "${tools_dir}/bin/sdkmanager" ]]; then
+    curl -fsSL --retry 3 \
+      "https://dl.google.com/android/repository/commandlinetools-linux-${ANDROID_CMDLINE_TOOLS_VERSION}_latest.zip" \
+      -o "${temp_dir}/commandlinetools.zip"
+    unzip -q "${temp_dir}/commandlinetools.zip" -d "${temp_dir}/tools"
+    sudo mv "${temp_dir}/tools/cmdline-tools" "${tools_dir}"
+    sudo chown -R "${RUNNER_USER}:${RUNNER_USER}" "${tools_dir}"
+  fi
+  sudo ln -sfn "${tools_dir}" "${ANDROID_SDK_DIR}/cmdline-tools/latest"
+
+  # Finite stdin avoids the SIGPIPE failure of `yes | sdkmanager` with pipefail.
+  printf 'y\n%.0s' {1..100} > "${temp_dir}/licenses"
+  # The bootstrap user owns the temporary license input.
+  # shellcheck disable=SC2024
+  sudo -u "${RUNNER_USER}" env JAVA_HOME="${ANDROID_JAVA_HOME}" \
+    "${tools_dir}/bin/sdkmanager" --sdk_root="${ANDROID_SDK_DIR}" --licenses \
+    < "${temp_dir}/licenses" > /dev/null
+  sudo -u "${RUNNER_USER}" env JAVA_HOME="${ANDROID_JAVA_HOME}" \
+    "${tools_dir}/bin/sdkmanager" --sdk_root="${ANDROID_SDK_DIR}" --install \
+    platform-tools emulator \
+    'platforms;android-35' 'platforms;android-36' \
+    'build-tools;36.0.0' 'build-tools;37.0.0' \
+    'ndk;27.1.12297006' 'cmake;3.22.1' 'cmake;3.30.5' \
+    'system-images;android-35;google_apis;x86_64'
+  rm -rf "${temp_dir}"
+
+  sudo -u "${RUNNER_USER}" "${ANDROID_SDK_DIR}/emulator/emulator" -accel-check \
+    || die "KVM acceleration is unavailable to ${RUNNER_USER}. Check host virtualization support."
+
+  sudo tee /etc/profile.d/android.sh > /dev/null << EOF
+export ANDROID_HOME=${ANDROID_SDK_DIR}
+export ANDROID_SDK_ROOT=${ANDROID_SDK_DIR}
+export JAVA_HOME_17_X64=${ANDROID_JAVA_HOME}
+export PATH=${ANDROID_SDK_DIR}/cmdline-tools/latest/bin:${ANDROID_SDK_DIR}/platform-tools:${ANDROID_SDK_DIR}/emulator:\$PATH
+EOF
+  info "Android SDK, API 35 image, build tools, NDK, CMake, and KVM are ready"
+}
+
+# Apply this even when an existing runner skips GitHub re-registration.
+configure_runner_android() {
+  local idx=$1
+  [[ "$RUNNER_ARCH" == "x64" ]] || return 0
+  local instance_dir="${RUNNER_WORKDIR}/${idx}"
+  local avd_name="petsy-api35-${idx}"
+  local emulator_port=$((5554 + (idx - 1) * 2))
+  [[ "$emulator_port" -le 5682 ]] || die "Too many Android emulator instances (maximum 65)."
+
+  local env_file="${instance_dir}/.env" path_file="${instance_dir}/.path"
+  local temp_env temp_path current_path
+  temp_env=$(mktemp)
+  temp_path=$(mktemp)
+  if [[ -f "$env_file" ]]; then
+    # The bootstrap user owns the temporary output.
+    # shellcheck disable=SC2024
+    sudo sed -E '/^(ANDROID_HOME|ANDROID_SDK_ROOT|JAVA_HOME|JAVA_HOME_17_X64|PETSY_ANDROID_AVD_NAME|PETSY_ANDROID_EMULATOR_PORT)=/d' \
+      "$env_file" > "$temp_env"
+  fi
+  cat >> "$temp_env" << EOF
+ANDROID_HOME=${ANDROID_SDK_DIR}
+ANDROID_SDK_ROOT=${ANDROID_SDK_DIR}
+JAVA_HOME=${ANDROID_JAVA_HOME}
+JAVA_HOME_17_X64=${ANDROID_JAVA_HOME}
+PETSY_ANDROID_AVD_NAME=${avd_name}
+PETSY_ANDROID_EMULATOR_PORT=${emulator_port}
+EOF
+  current_path="${PATH}"
+  if [[ -f "$path_file" ]]; then
+    current_path=$(sudo cat "$path_file")
+  fi
+  local android_path="${ANDROID_SDK_DIR}/cmdline-tools/latest/bin:${ANDROID_SDK_DIR}/platform-tools:${ANDROID_SDK_DIR}/emulator"
+  # Keep reruns from repeatedly prepending the same SDK paths.
+  current_path="${current_path#"${android_path}:"}"
+  printf '%s:%s\n' "$android_path" "$current_path" > "$temp_path"
+  ANDROID_RUNNER_ENV_CHANGED=false
+  if ! sudo cmp -s "$temp_env" "$env_file" || ! sudo cmp -s "$temp_path" "$path_file"; then
+    ANDROID_RUNNER_ENV_CHANGED=true
+    sudo install -o "${RUNNER_USER}" -g "${RUNNER_USER}" -m 0600 "$temp_env" "$env_file"
+    sudo install -o "${RUNNER_USER}" -g "${RUNNER_USER}" -m 0644 "$temp_path" "$path_file"
+  fi
+  rm "$temp_env" "$temp_path"
+
+  # SDK downloads are shared; writable AVD state is separate for each runner.
+  if ! sudo -u "${RUNNER_USER}" test -d "/home/${RUNNER_USER}/.android/avd/${avd_name}.avd"; then
+    sudo -u "${RUNNER_USER}" env JAVA_HOME="${ANDROID_JAVA_HOME}" \
+      ANDROID_HOME="${ANDROID_SDK_DIR}" ANDROID_SDK_ROOT="${ANDROID_SDK_DIR}" \
+      "${ANDROID_SDK_DIR}/cmdline-tools/latest/bin/avdmanager" create avd \
+      --name "$avd_name" --package 'system-images;android-35;google_apis;x86_64' \
+      --device pixel_6 <<< no
+  fi
 }
 
 install_go() {
@@ -550,7 +685,12 @@ setup_runner_instance() {
   local pkg_dir="${RUNNER_WORKDIR}/.pkg"
 
   if [[ "${FORCE}" == "false" ]] && runner_instance_ok "$idx"; then
-    info "Runner '${runner_name}' already configured and running — skipping"
+    configure_runner_android "$idx"
+    if [[ "${ANDROID_RUNNER_ENV_CHANGED:-false}" == "true" ]]; then
+      sudo systemctl restart "$(cat "${instance_dir}/.service")"
+      info "Restarted '${runner_name}' to load Android environment and KVM group"
+    fi
+    info "Runner '${runner_name}' already configured and running — skipping registration"
     return
   fi
 
@@ -601,6 +741,8 @@ setup_runner_instance() {
       --replace
   "
 
+  configure_runner_android "$idx"
+
   ( cd "${instance_dir}" && sudo ./svc.sh install "${RUNNER_USER}" && sudo ./svc.sh start )
 
   info "Runner '${runner_name}' started"
@@ -643,6 +785,7 @@ print_plan() {
   echo -e "${BLUE}│${NC}"
   printf  "${BLUE}│${NC}  Tools: Docker · Node 24 · Go · .NET 10 · Rust · Java · PostgreSQL 18 client\n"
   printf  "${BLUE}│${NC}         AWS CLI · Azure CLI · gcloud · kubectl · Helm · gh\n"
+  printf '%b\n' "${BLUE}│${NC}  Android: JDK 17 · SDK 35/36 · API 35 emulator · NDK · CMake · KVM (x64)"
   printf  "${BLUE}│${NC}  Cron  : daily Docker + workspace cleanup at 03:00\n"
   echo -e "${BLUE}└────────────────────────────────────────────────────────────┘${NC}"
   echo
@@ -657,15 +800,39 @@ countdown() {
   printf "\r  %-60s\n" "Starting..."
 }
 
+# Discover installed instances instead of asking for GitHub registration settings.
+refresh_runner_os_config() {
+  local instance_dir idx service
+  for instance_dir in "${RUNNER_WORKDIR}"/*; do
+    [[ -f "${instance_dir}/.runner" ]] || continue
+    idx="${instance_dir##*/}"
+    [[ "$idx" =~ ^[1-9][0-9]*$ ]] || continue
+    configure_runner_android "$idx"
+    if [[ "${ANDROID_RUNNER_ENV_CHANGED:-false}" == "true" && -f "${instance_dir}/.service" ]]; then
+      service=$(cat "${instance_dir}/.service")
+      if systemctl is-active --quiet "$service"; then
+        sudo systemctl restart "$service"
+        info "Restarted '${service}' to load updated OS configuration"
+      fi
+    fi
+  done
+}
+
 main() {
   for arg in "$@"; do
     case "$arg" in
       --force) FORCE=true ;;
-      *) die "Unknown argument: ${arg}\n\n  Usage: bash setup.sh [--force]" ;;
+      --os-only) OS_ONLY=true ;;
+      *) die "Unknown argument: ${arg}\n\n  Usage: bash setup.sh [--force | --os-only]" ;;
     esac
   done
 
-  validate_env
+  if [[ "${OS_ONLY}" == "true" ]]; then
+    RUNNER_WORKDIR="${RUNNER_WORKDIR:-/opt/actions-runner}"
+    export RUNNER_WORKDIR
+  else
+    validate_env
+  fi
 
   # If running as root: create the dedicated runner user (if absent), grant it
   # passwordless sudo with env passthrough, then re-exec as that user.
@@ -698,9 +865,14 @@ main() {
   command -v sudo &>/dev/null || die "sudo not found"
   command -v curl &>/dev/null || die "curl not found — install it first"
 
-  check_github_permissions
-
-  print_plan
+  if [[ "${OS_ONLY}" == "true" ]]; then
+    section "OS-only update"
+    info "Updating host tools and configuration; GitHub registration is unchanged"
+    info "Existing runner directory: ${RUNNER_WORKDIR}"
+  else
+    check_github_permissions
+    print_plan
+  fi
   countdown 5
 
   install_system_packages
@@ -710,6 +882,7 @@ main() {
 
   install_docker
   install_node
+  install_android
   install_go
   install_dotnet
   install_postgres_client
@@ -722,14 +895,18 @@ main() {
   install_gh_cli
   install_cleanup_cron
 
-  download_runner
-
-  for ((i = 1; i <= RUNNER_COUNT; i++)); do
-    setup_runner_instance "$i"
-  done
-
-  section "Done"
-  info "All ${RUNNER_COUNT} runner instance(s) configured and running."
+  if [[ "${OS_ONLY}" == "true" ]]; then
+    refresh_runner_os_config
+    section "Done"
+    info "Host tools and OS configuration aligned; existing runner registration preserved."
+  else
+    download_runner
+    for ((i = 1; i <= RUNNER_COUNT; i++)); do
+      setup_runner_instance "$i"
+    done
+    section "Done"
+    info "All ${RUNNER_COUNT} runner instance(s) configured and running."
+  fi
   info ""
   info "Check status : sudo systemctl list-units 'actions.runner.*'"
   info "Stream logs  : sudo journalctl -u 'actions.runner.*' -f"
