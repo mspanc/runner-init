@@ -536,6 +536,9 @@ install_cleanup_cron() {
   local script_path="/usr/local/bin/runner-cleanup.sh"
   local cron_path="/etc/cron.d/runner-cleanup"
   local logrotate_path="/etc/logrotate.d/runner-cleanup"
+  local runner_home
+  runner_home=$(getent passwd "${RUNNER_USER}" | cut -d: -f6)
+  [[ -n "$runner_home" ]] || die "Cannot resolve home directory for ${RUNNER_USER}"
 
   sudo tee "$script_path" > /dev/null << SCRIPT
 #!/usr/bin/env bash
@@ -544,6 +547,7 @@ set -euo pipefail
 
 LOG=/var/log/runner-cleanup.log
 RUNNER_WORKDIR="${RUNNER_WORKDIR}"
+RUNNER_HOME="${runner_home}"
 
 {
   echo "=== \$(date -Iseconds) ==="
@@ -564,6 +568,21 @@ RUNNER_WORKDIR="${RUNNER_WORKDIR}"
   echo "-- runner workspaces not touched in 24 h+ --"
   find "\${RUNNER_WORKDIR}"/*/._work -mindepth 1 -maxdepth 1 \
     -type d -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+
+  echo "-- runner cache entries older than 1 day --"
+  if [[ -d "\${RUNNER_HOME}/.cache" ]]; then
+    find "\${RUNNER_HOME}/.cache" -mindepth 1 -maxdepth 1 \\
+      ! -name petsy-e2e -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+
+    # Never unlink archive locks; another job may already be waiting on them.
+    if [[ -d "\${RUNNER_HOME}/.cache/petsy-e2e" ]]; then
+      find "\${RUNNER_HOME}/.cache/petsy-e2e" -maxdepth 1 \\
+        -type f -name '*.tar' -mtime +1 -print0 | \\
+        while IFS= read -r -d '' archive; do
+          flock -n "\${archive%.tar}.lock" find "\$archive" -maxdepth 0 -mtime +1 -delete || true
+        done
+    fi
+  fi
 
   echo "-- /tmp entries older than 1 day --"
   find /tmp -mindepth 1 -maxdepth 1 -mtime +1 ! -name '.X*' \
